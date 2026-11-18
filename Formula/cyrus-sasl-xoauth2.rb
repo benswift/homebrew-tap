@@ -14,15 +14,12 @@ class CyrusSaslXoauth2 < Formula
 
   uses_from_macos "cyrus-sasl"
 
-  # Return the plugin init result; newer clang treats the missing return as an
-  # error. Merged upstream after v0.2 (no release since).
-  patch do
-    url "https://github.com/moriyoshi/cyrus-sasl-xoauth2/commit/a0d05939c6da485a99cb92f628194f8b4e94a19d.patch?full_index=1"
-    sha256 "37ebd052a1fbc59eb2dc1787bce7bebbe8edc553559d24185072197a6e6f3612"
-  end
-
   def install
     sasl_prefix = OS.mac? ? MacOS.sdk_path/"usr" : formula_opt_prefix("cyrus-sasl")
+    # The plugin entry points fall off the end instead of returning their
+    # result, which libsasl2 checks. Fixed upstream after v0.2, the latest tag:
+    # https://github.com/moriyoshi/cyrus-sasl-xoauth2/commit/a0d05939c6da485a99cb92f628194f8b4e94a19d
+    inreplace "xoauth2_init.c", "    xoauth2_", "    return xoauth2_"
     # Upstream's autogen.sh calls libtoolize (glibtoolize on macOS) and runs
     # automake in --foreign mode; autoreconf does neither by default.
     inreplace "configure.ac", "AM_INIT_AUTOMAKE", "AM_INIT_AUTOMAKE([foreign])"
@@ -33,13 +30,13 @@ class CyrusSaslXoauth2 < Formula
   end
 
   def caveats
-    system_plugins = OS.mac? ? "/usr/lib/sasl2" : "#{formula_opt_lib("cyrus-sasl")}/sasl2"
     <<~EOS
       Cyrus SASL loads plugins only from its search path. Set SASL_PATH wherever
-      mbsync (or another SASL client) runs, including launchd or systemd jobs:
-        export SASL_PATH="#{opt_lib}/sasl2:#{system_plugins}"
-      This plugin's directory must come first: macOS's libsasl2 has its own
-      XOAUTH2 mechanism, which mbsync cannot use.
+      mbsync (or another SASL client) runs, including launchd or systemd jobs,
+      with this plugin's directory ahead of the system plugins:
+        export SASL_PATH="#{opt_lib}/sasl2:/usr/lib/sasl2"
+      It must come first on macOS, whose libsasl2 has its own XOAUTH2 mechanism
+      that mbsync cannot use.
     EOS
   end
 
