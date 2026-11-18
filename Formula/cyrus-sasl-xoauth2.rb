@@ -1,59 +1,75 @@
 class CyrusSaslXoauth2 < Formula
-  desc "Cyrus SASL with the XOAUTH2 mechanism plugin (OAuth2 for mbsync/isync)"
+  desc "XOAUTH2 mechanism plugin for Cyrus SASL"
   homepage "https://github.com/moriyoshi/cyrus-sasl-xoauth2"
-  url "https://github.com/cyrusimap/cyrus-sasl/releases/download/cyrus-sasl-2.1.28/cyrus-sasl-2.1.28.tar.gz"
-  sha256 "7ccfc6abd01ed67c1a0924b353e526f1b766b21f42d4562ee635a8ebfc5bb38c"
-  license "BSD-3-Clause-Attribution"
-
-  # Private SASL build for the mail stack; deliberately not linked into the
-  # prefix so it never shadows the system SASL or homebrew-core's cyrus-sasl.
-  keg_only "it is a dedicated SASL build for isync and is referenced by opt_prefix"
+  url "https://github.com/moriyoshi/cyrus-sasl-xoauth2/archive/refs/tags/v0.2.tar.gz"
+  sha256 "a62c26566098100d30aa254e4c1aa4309876b470f139e1019bb9032b6e2ee943"
+  license "MIT"
+  # This tap's earlier cyrus-sasl-xoauth2 was a whole Cyrus SASL build versioned
+  # 2.1.28; the scheme bump lets existing installs upgrade to the plugin alone.
+  version_scheme 1
 
   depends_on "autoconf" => :build
   depends_on "automake" => :build
   depends_on "libtool" => :build
-  depends_on "krb5"
-  depends_on "openssl@3"
 
-  uses_from_macos "libxcrypt"
+  uses_from_macos "cyrus-sasl"
 
-  # XOAUTH2 SASL mechanism plugin (moriyoshi/cyrus-sasl-xoauth2), pinned to
-  # master HEAD --- ahead of the v0.2 tag (2020) with a clang return-value fix
-  # that newer toolchains otherwise treat as a hard error. Built into the same
-  # keg as cyrus-sasl so it lands in libsasl2's own plugin dir; no SASL_PATH
-  # wiring is needed for mbsync (or anything else) to find it.
-  resource "xoauth2" do
-    url "https://github.com/moriyoshi/cyrus-sasl-xoauth2/archive/36aabca54fd65c8fa7a707cb4936751599967904.tar.gz"
-    sha256 "07d7a77c7c27f83923b830cbdd415602d680e85f4b8a2bdaf616322aea11b8dd"
+  # Return the plugin init result; newer clang treats the missing return as an
+  # error. Merged upstream after v0.2 (no release since).
+  patch do
+    url "https://github.com/moriyoshi/cyrus-sasl-xoauth2/commit/a0d05939c6da485a99cb92f628194f8b4e94a19d.patch?full_index=1"
+    sha256 "37ebd052a1fbc59eb2dc1787bce7bebbe8edc553559d24185072197a6e6f3612"
   end
 
   def install
-    # Build cyrus-sasl itself, mirroring homebrew-core's cyrus-sasl formula.
-    system "./configure",
-           "--disable-macos-framework",
-           "--disable-dependency-tracking",
-           "--disable-silent-rules",
-           "--prefix=#{prefix}"
-    system "make", "install"
+    sasl_prefix = OS.mac? ? MacOS.sdk_path/"usr" : formula_opt_prefix("cyrus-sasl")
+    # Upstream's autogen.sh calls libtoolize (glibtoolize on macOS) and runs
+    # automake in --foreign mode; autoreconf does neither by default.
+    inreplace "configure.ac", "AM_INIT_AUTOMAKE", "AM_INIT_AUTOMAKE([foreign])"
+    mkdir "m4"
+    system "autoreconf", "--force", "--install", "--verbose"
+    system "./configure", "--disable-static", "--with-cyrus-sasl=#{sasl_prefix}", *std_configure_args
+    system "make", "install", "pkglibdir=#{lib}/sasl2"
+  end
 
-    # Build the XOAUTH2 plugin against the cyrus-sasl we just installed. Its
-    # Makefile.am installs libxoauth2.so into ${CYRUS_SASL_PREFIX}/lib/sasl2,
-    # i.e. right beside the stock mechanisms in this keg.
-    resource("xoauth2").stage do
-      # Upstream's autogen.sh runs automake in --foreign mode; autoreconf does
-      # not, so without this it fails on missing GNU files (AUTHORS/NEWS/...).
-      inreplace "configure.ac", "AM_INIT_AUTOMAKE", "AM_INIT_AUTOMAKE([foreign])"
-      mkdir "m4"
-      system "autoreconf", "--force", "--install", "--verbose"
-      system "./configure", "--with-cyrus-sasl=#{prefix}"
-      system "make", "install"
-    end
+  def caveats
+    system_plugins = OS.mac? ? "/usr/lib/sasl2" : "#{formula_opt_lib("cyrus-sasl")}/sasl2"
+    <<~EOS
+      Cyrus SASL loads plugins only from its search path. Set SASL_PATH wherever
+      mbsync (or another SASL client) runs, including launchd or systemd jobs:
+        export SASL_PATH="#{opt_lib}/sasl2:#{system_plugins}"
+      This plugin's directory must come first: macOS's libsasl2 has its own
+      XOAUTH2 mechanism, which mbsync cannot use.
+    EOS
   end
 
   test do
-    # The XOAUTH2 mechanism plugin is installed alongside the stock SASL
-    # mechanisms in this keg's plugin dir (pluginviewer would verify it loads,
-    # but it blocks on krb5/GSSAPI init under the sandboxed test runner).
-    assert_path_exists lib/"sasl2/libxoauth2.so"
+    (testpath/"test.c").write <<~C
+      #include <dlfcn.h>
+      #include <stdio.h>
+      #include <sasl/sasl.h>
+      #include <sasl/saslplug.h>
+
+      int main(int argc, char **argv) {
+        void *plugin = dlopen(argv[1], RTLD_NOW);
+        if (!plugin) {
+          fprintf(stderr, "%s\\n", dlerror());
+          return 1;
+        }
+        sasl_client_plug_init_t *init =
+            (sasl_client_plug_init_t *)dlsym(plugin, "sasl_client_plug_init");
+        int version, count;
+        sasl_client_plug_t *plugins;
+        if (!init || init(NULL, SASL_CLIENT_PLUG_VERSION, &version, &plugins, &count) != SASL_OK) {
+          return 2;
+        }
+        printf("%s", plugins[0].mech_name);
+        return 0;
+      }
+    C
+    flags = ["-Wno-deprecated-declarations"]
+    flags += ["-I#{formula_opt_include("cyrus-sasl")}", "-ldl"] if OS.linux?
+    system ENV.cc, "test.c", "-o", "test", *flags
+    assert_equal "XOAUTH2", shell_output("./test #{lib}/sasl2/libxoauth2.so")
   end
 end
